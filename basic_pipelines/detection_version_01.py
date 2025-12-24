@@ -195,15 +195,8 @@ class GStreamerDetectionAppNoDisplay(GStreamerDetectionApp):
         temp_args, _ = parser.parse_known_args()
         cli_input = temp_args.input
         
-        # Priority: 
-        # 1. CLI Argument (if provided and not None)
-        # 2. config.json file_path (if specified and not "NOT_SPECIFIED")
-        # 3. Default (rpi or example video)
-        
         input_source = cli_input
-        
         if cli_input is None:
-            # Use config.json if CLI is not provided
             if user_data.file_path != "NOT_SPECIFIED":
                 if user_data.file_path is None or str(user_data.file_path).lower() == "null":
                     input_source = "rpi"
@@ -211,12 +204,10 @@ class GStreamerDetectionAppNoDisplay(GStreamerDetectionApp):
                     input_source = user_data.file_path
                 print(f"✓ Using input source from config: {input_source}")
             else:
-                # Default fallback
                 input_source = "rpi"
         else:
             print(f"✓ Using input source from CLI: {input_source}")
             
-        # Update the parser's default value so the parent class uses it
         parser.set_defaults(input=input_source)
         
         self.detected_width = 1280
@@ -224,13 +215,15 @@ class GStreamerDetectionAppNoDisplay(GStreamerDetectionApp):
         
         if input_source:
             if input_source.startswith("rpi"):
-                # Raspberry Pi camera dynamic resolution
-                # You can customize these defaults for RPi here
-                self.detected_width = 2028
-                self.detected_height = 1520
-                print(f"✓ Using RPi camera resolution: {self.detected_width}x{self.detected_height}")
+                if user_data.input_resolution_width and user_data.input_resolution_height:
+                    self.detected_width = user_data.input_resolution_width
+                    self.detected_height = user_data.input_resolution_height
+                    print(f"✓ Using RPi camera with input resolution override: {self.detected_width}x{self.detected_height}")
+                else:
+                    self.detected_width = 2028
+                    self.detected_height = 1520
+                    print(f"✓ Using RPi camera native resolution: {self.detected_width}x{self.detected_height}")
             elif not input_source.startswith("libcamera") and os.path.exists(input_source):
-                # If it's a file, try to get resolution
                 cap = cv2.VideoCapture(input_source)
                 if cap.isOpened():
                     self.detected_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -238,16 +231,80 @@ class GStreamerDetectionAppNoDisplay(GStreamerDetectionApp):
                     cap.release()
                     print(f"✓ Detected dynamic resolution from input file: {self.detected_width}x{self.detected_height}")
         
-        # Initialize the parent class
         super().__init__(app_callback, user_data, parser)
 
     def get_pipeline_string(self):
-        # Override dimensions with detected values
+        from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_helper_pipelines import (
+            SOURCE_PIPELINE, INFERENCE_PIPELINE, INFERENCE_PIPELINE_WRAPPER, 
+            TRACKER_PIPELINE, USER_CALLBACK_PIPELINE, QUEUE
+        )
+        
+        # Override base class variables to ensure camera thread uses correct resolution
         self.video_width = self.detected_width
         self.video_height = self.detected_height
-        # Set video_sink to fakesink to suppress the main GStreamer window
-        self.video_sink = "fakesink"
-        return super().get_pipeline_string()
+        
+        # 1. Source (Hardware Scaling to input_resolution happens here)
+        source_pipeline = SOURCE_PIPELINE(video_source=self.video_source,
+                                          video_width=self.video_width, video_height=self.video_height,
+                                          frame_rate=self.frame_rate, sync=self.sync)
+        
+        # 2. Inference
+        inference_pipeline = INFERENCE_PIPELINE(
+            hef_path=self.hef_path,
+            post_process_so=self.post_process_so,
+            post_function_name=self.post_function_name,
+            batch_size=self.batch_size,
+            config_json=self.labels_json,
+            additional_params=self.thresholds_str)
+        inference_pipeline_wrapper = INFERENCE_PIPELINE_WRAPPER(inference_pipeline)
+        
+        # 3. Tracker
+        tracker_pipeline = TRACKER_PIPELINE(class_id=1)
+        
+        # 4. Hardware Filter (Python Callback to remove unwanted detections)
+        # We use an identity element to hook our filtering logic BEFORE the overlay
+        filter_pipeline = f"{QUEUE(name='filter_q')} ! identity name=identity_filter"
+        
+        # 5. Hardware Overlay (Box Drawing) - Faster than Python
+        overlay_pipeline = f"{QUEUE(name='hailo_overlay_q')} ! hailooverlay"
+        
+        # 6. Hardware Scaling & Conversion (Only include if pixels are needed)
+        needs_frame = self.user_data.gui_preview or self.user_data.web_preview or self.user_data.display_preview or self.user_data.show_boxes_only
+        
+        if needs_frame:
+            preview_width = self.detected_width
+            preview_height = self.detected_height
+            
+            # Ensure width/height are even (required by some hardware encoders/scalers)
+            preview_width = (preview_width // 2) * 2
+            preview_height = (preview_height // 2) * 2
+            
+            hardware_post_proc = (
+                f"! {QUEUE(name='preview_scale_q')} ! videoscale name=preview_videoscale ! "
+                f"video/x-raw, width={preview_width}, height={preview_height} ! "
+                f"{QUEUE(name='preview_convert_q')} ! videoconvert name=preview_videoconvert ! "
+                f"video/x-raw, format=RGB"
+            )
+        else:
+            hardware_post_proc = ""
+        
+        # 7. User Callback (Python logic for display/grid)
+        user_callback_pipeline = USER_CALLBACK_PIPELINE()
+        
+        # 8. Hardware Sink (fakesink to suppress second window)
+        sink_pipeline = f"fakesink name=hailo_display sync={self.sync}"
+
+        pipeline_string = (
+            f'{source_pipeline} ! '
+            f'{inference_pipeline_wrapper} ! '
+            f'{tracker_pipeline} ! '
+            f'{filter_pipeline} ! '
+            f'{overlay_pipeline} '
+            f'{hardware_post_proc} ! '
+            f'{user_callback_pipeline} ! '
+            f'{sink_pipeline}'
+        )
+        return pipeline_string
 
 # -----------------------------------------------------------------------------------------------
 # User-defined helper functions
@@ -388,7 +445,8 @@ class user_app_callback_class(app_callback_class):
         self.confidence_threshold = 0.5
         self.frame_skip = 1
         self.file_path = "NOT_SPECIFIED"
-        self.display_scale = 1.0
+        self.input_resolution_width = None
+        self.input_resolution_height = None
         
         # Preview toggles
         self.web_preview = False
@@ -409,10 +467,15 @@ class user_app_callback_class(app_callback_class):
                     self.show_boxes_only = config.get("show_boxes_only", False)
                     self.confidence_threshold = float(config.get("confidence_threshold", 0.5))
                     self.frame_skip = int(config.get("frame_skip", 1))
-                    self.display_scale = float(config.get("display_scale", 1.0))
                     
                     if "file_path" in config:
                         self.file_path = config["file_path"]
+                    
+                    # Handle input resolution override
+                    input_res = config.get("input_resolution", {})
+                    if input_res:
+                        self.input_resolution_width = int(input_res.get("width", 0)) if input_res.get("width") else None
+                        self.input_resolution_height = int(input_res.get("height", 0)) if input_res.get("height") else None
                     
                     # New preview toggles
                     self.web_preview = config.get("web_preview", self.web_preview)
@@ -428,8 +491,10 @@ class user_app_callback_class(app_callback_class):
                         
                     print(f"✓ Config loaded: show_boxes_only={self.show_boxes_only}, "
                           f"confidence={self.confidence_threshold}, frame_skip={self.frame_skip}, "
-                          f"scale={self.display_scale}, classes={detection_classes}, "
+                          f"classes={detection_classes}, "
                           f"web={self.web_preview}, gui={self.gui_preview}, display={self.display_preview}")
+                    if self.input_resolution_width and self.input_resolution_height:
+                        print(f"  Input resolution override: {self.input_resolution_width}x{self.input_resolution_height}")
             except Exception as e:
                 print(f"⚠️  Failed to read config.json: {e}")
 
@@ -455,6 +520,38 @@ class user_app_callback_class(app_callback_class):
 # -----------------------------------------------------------------------------------------------
 
 # This is the callback function that will be called when data is available from the pipeline
+def filter_callback(pad, info, user_data):
+    """Filter detections in hardware ROI before they reach the overlay."""
+    buffer = info.get_buffer()
+    if buffer is None:
+        return Gst.PadProbeReturn.OK
+
+    # Get the ROI from the buffer
+    roi = hailo.get_roi_from_buffer(buffer)
+    detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
+
+    # If all classes are allowed, do nothing
+    if user_data.allowed_classes_set is None:
+        return Gst.PadProbeReturn.OK
+
+    # Remove objects that are not in the allowed classes or below confidence threshold
+    for det in detections:
+        label = det.get_label().lower()
+        confidence = det.get_confidence()
+        
+        # Check both class and confidence
+        is_allowed = True
+        if user_data.allowed_classes_set is not None and label not in user_data.allowed_classes_set:
+            is_allowed = False
+        if confidence < user_data.confidence_threshold:
+            is_allowed = False
+            
+        if not is_allowed:
+            roi.remove_object(det)
+            
+    return Gst.PadProbeReturn.OK
+
+# This is the callback function that will be called for display logic
 def app_callback(pad, info, user_data):
     # Get the GstBuffer from the probe info
     buffer = info.get_buffer()
@@ -474,11 +571,18 @@ def app_callback(pad, info, user_data):
     # Get the caps from the pad
     format, width, height = get_caps_from_pad(pad)
 
+    # Determine if we actually need the frame pixels
+    needs_frame = user_data.show_boxes_only or user_data.gui_preview or user_data.web_preview or user_data.display_preview
+    
     # If the user_data.use_frame is set to True, we can get the video frame from the buffer
     frame = None
-    if user_data.use_frame and format is not None and width is not None and height is not None:
+    if needs_frame and user_data.use_frame and format is not None and width is not None and height is not None:
         # Get video frame
+        # Using get_numpy_from_buffer which is optimized for RGB
         frame = get_numpy_from_buffer(buffer, format, width, height)
+    elif user_data.use_frame and not needs_frame:
+        # Optimization: skip copy if no preview is active
+        pass
     else:
         # If frame is not available but expected, log once
         if user_data.use_frame and not hasattr(user_data, '_frame_error_logged'):
@@ -489,26 +593,7 @@ def app_callback(pad, info, user_data):
     roi = hailo.get_roi_from_buffer(buffer)
     detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
 
-    # Filter detections by confidence and allowed classes
-    filtered_detections = []
-    for det in detections:
-        label = det.get_label().lower()
-        confidence = det.get_confidence()
-        
-        # Check confidence threshold
-        if confidence < user_data.confidence_threshold:
-            continue
-            
-        # Check class filter
-        if user_data.allowed_classes_set is not None:
-            if label not in user_data.allowed_classes_set:
-                continue
-        
-        filtered_detections.append(det)
-    
-    detections = filtered_detections
-
-    # Parse the detections
+    # Parse the detections (they are already filtered by filter_callback)
     detection_count = 0
     for detection in detections:
         label = detection.get_label()
@@ -529,69 +614,25 @@ def app_callback(pad, info, user_data):
         detection_count += 1
         
     if user_data.use_frame and frame is not None:
-        # OPTIMIZATION: Only process frame if at least one preview is enabled
+        # OPTIMIZATION: Only process pixels if at least one preview is active
         any_preview = user_data.gui_preview or user_data.web_preview or user_data.display_preview
         
         if any_preview:
-            # Handle "boxes only" preview mode or normal mode
+            # Convert to BGR for OpenCV/Preview (GStreamer is now sending RGB)
+            # We do this first so both Grid and Normal modes work with BGR
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            # Handle "boxes only" preview mode (Grid Mode still requires CPU)
             if user_data.show_boxes_only:
-                # Create grid of cropped boxes
                 if user_data.get_count() % 30 == 0:
                     print(f"DEBUG: Grid mode active. Detections: {len(detections)}")
                 frame = extract_boxes_grid(frame, detections, width, height)
             else:
+                # NORMAL MODE IS NOW FULLY HARDWARE ACCELERATED
+                # No more cv2.rectangle, cv2.putText, or cv2.cvtColor here.
+                # The 'frame' already has boxes, is BGR, and is Scaled from GStreamer.
                 if user_data.get_count() % 30 == 0:
-                    print(f"DEBUG: Normal mode active. Detections: {len(detections)}")
-                # Normal mode: Draw bounding boxes on full frame
-                for detection in detections:
-                    label = detection.get_label()
-                    bbox = detection.get_bbox()
-                    confidence = detection.get_confidence()
-                    
-                    # Get tracking ID
-                    track_id = None
-                    track = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
-                    if len(track) == 1:
-                        track_id = track[0].get_id()
-                    
-                    x_min = int(bbox.xmin() * width)
-                    y_min = int(bbox.ymin() * height)
-                    w = int(bbox.width() * width)
-                    h = int(bbox.height() * height)
-                    x_max = x_min + w
-                    y_max = y_min + h
-                    
-                    # Clamp coordinates
-                    x_min = max(0, min(x_min, width))
-                    y_min = max(0, min(y_min, height))
-                    x_max = max(0, min(x_max, width))
-                    y_max = max(0, min(y_max, height))
-                    
-                    cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-                    
-                    # Build label with tracking ID if available
-                    if track_id is not None:
-                        label_text = f"ID:{track_id} {label}: {confidence:.2f}"
-                    else:
-                        label_text = f"{label}: {confidence:.2f}"
-                    
-                    cv2.putText(frame, label_text, (x_min, y_min - 10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-            # Print the detection count and other info to the frame
-            cv2.putText(frame, f"Detections: {detection_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame, f"{user_data.new_function()} {user_data.new_variable}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            # Convert the frame to BGR for display
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            
-            # Apply display scale if configured
-            if user_data.display_scale != 1.0:
-                h, w = frame.shape[:2]
-                new_w = int(w * user_data.display_scale)
-                new_h = int(h * user_data.display_scale)
-                if new_w > 0 and new_h > 0:
-                    frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                    print(f"DEBUG: Normal mode active (Full Hardware Post-Proc). Detections: {len(detections)}")
             
             # Update latest_frame for web streaming
             if user_data.web_preview:
@@ -639,6 +680,13 @@ if __name__ == "__main__":
                 time.sleep(1)
     
     gstreamer_app.display_user_data_frame = patched_display
+    
+    # Connect the hardware filter probe BEFORE running the pipeline
+    filter_identity = app.pipeline.get_by_name("identity_filter")
+    if filter_identity:
+        filter_pad = filter_identity.get_static_pad("src")
+        filter_pad.add_probe(Gst.PadProbeType.BUFFER, filter_callback, user_data)
+        print("✓ Hardware filter connected (filtering before box overlay)")
     
     app.run()
 
