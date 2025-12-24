@@ -9,7 +9,118 @@ import hailo
 import json
 import threading
 import time
+import socket
+import sys
+from flask import Flask, Response, render_template_string
 from hailo_apps.hailo_app_python.core.gstreamer import gstreamer_app
+
+# Access Whisplay driver
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+WHISPLAY_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", "Whisplay"))
+DRIVER_DIR = os.path.join(WHISPLAY_DIR, "Driver")
+if DRIVER_DIR not in sys.path:
+    sys.path.append(DRIVER_DIR)
+try:
+    from WhisPlay import WhisPlayBoard
+except Exception:
+    WhisPlayBoard = None
+
+# Whisplay constants
+WHISPLAY_WIDTH = 240
+WHISPLAY_HEIGHT = 280
+
+# Global frame buffer for web streaming
+latest_frame = None
+frame_lock = threading.Lock()
+WEB_PORT = 8080
+
+def image_to_rgb565(frame: np.ndarray) -> list:
+    """Convert OpenCV BGR frame to RGB565 byte list for Whisplay display."""
+    # Resize to fit Whisplay
+    resized = cv2.resize(frame, (WHISPLAY_WIDTH, WHISPLAY_HEIGHT), interpolation=cv2.INTER_AREA)
+    # Convert BGR to RGB
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    
+    # Efficient conversion to RGB565 using numpy
+    r = rgb[:, :, 0].astype(np.uint16)
+    g = rgb[:, :, 1].astype(np.uint16)
+    b = rgb[:, :, 2].astype(np.uint16)
+    
+    rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+    
+    # Convert to big-endian bytes
+    high_byte = (rgb565 >> 8).astype(np.uint8)
+    low_byte = (rgb565 & 0xFF).astype(np.uint8)
+    
+    # Stack and flatten
+    pixel_data = np.stack((high_byte, low_byte), axis=2).flatten().tolist()
+    return pixel_data
+
+# HTML template for web interface
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Hailo RPi5 Detection Preview</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #1a1a1a; color: #ffffff; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 { text-align: center; color: #4CAF50; }
+        .video-container { text-align: center; background-color: #000; padding: 10px; border-radius: 10px; margin: 20px 0; }
+        img { max-width: 100%; height: auto; border: 2px solid #4CAF50; border-radius: 5px; }
+        .info { background-color: #2a2a2a; padding: 15px; border-radius: 5px; margin: 10px 0; }
+        .status { display: inline-block; padding: 5px 10px; border-radius: 3px; margin: 5px; background-color: #4CAF50; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎥 Hailo RPi5 Detection Preview</h1>
+        <div class="info">
+            <strong>Status:</strong> <span class="status">LIVE</span>
+        </div>
+        <div class="video-container">
+            <img src="/video_feed" alt="Live Detection Stream">
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+def get_local_ip():
+    """Get the local IP address of the device."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "localhost"
+
+def generate_frames():
+    """Generate MJPEG frames for video streaming."""
+    while True:
+        with frame_lock:
+            if latest_frame is not None:
+                # latest_frame is already BGR (ready for encode)
+                ret, buffer = cv2.imencode('.jpg', latest_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if ret:
+                    frame_bytes = buffer.tobytes()
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        time.sleep(0.033)  # ~30 FPS
+
+def start_web_server():
+    """Start Flask web server."""
+    app = Flask(__name__)
+    @app.route('/')
+    def index(): return render_template_string(HTML_TEMPLATE)
+    @app.route('/video_feed')
+    def video_feed(): return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    
+    local_ip = get_local_ip()
+    print(f"\n🌐 Web server starting at http://{local_ip}:{WEB_PORT}")
+    app.run(host='0.0.0.0', port=WEB_PORT, threaded=True, debug=False)
 
 # -----------------------------------------------------------------------------------------------
 # Monkey-patch picamera_thread to fix high resolution issues
@@ -80,20 +191,33 @@ class GStreamerDetectionAppNoDisplay(GStreamerDetectionApp):
             from hailo_apps.hailo_app_python.core.common.core import get_default_parser
             parser = get_default_parser()
         
-        # Override the input if provided in config.json
-        if user_data.file_path != "NOT_SPECIFIED":
-            # If JSON null (Python None) or string "null", default to "rpi"
-            if user_data.file_path is None or str(user_data.file_path).lower() == "null":
-                input_source = "rpi"
+        # Check CLI arguments first
+        temp_args, _ = parser.parse_known_args()
+        cli_input = temp_args.input
+        
+        # Priority: 
+        # 1. CLI Argument (if provided and not None)
+        # 2. config.json file_path (if specified and not "NOT_SPECIFIED")
+        # 3. Default (rpi or example video)
+        
+        input_source = cli_input
+        
+        if cli_input is None:
+            # Use config.json if CLI is not provided
+            if user_data.file_path != "NOT_SPECIFIED":
+                if user_data.file_path is None or str(user_data.file_path).lower() == "null":
+                    input_source = "rpi"
+                else:
+                    input_source = user_data.file_path
+                print(f"✓ Using input source from config: {input_source}")
             else:
-                input_source = user_data.file_path
-            
-            # Update the parser's default value so the parent class uses it
-            parser.set_defaults(input=input_source)
-            print(f"✓ Using input source from config: {input_source}")
+                # Default fallback
+                input_source = "rpi"
         else:
-            temp_args, _ = parser.parse_known_args()
-            input_source = temp_args.input
+            print(f"✓ Using input source from CLI: {input_source}")
+            
+        # Update the parser's default value so the parent class uses it
+        parser.set_defaults(input=input_source)
         
         self.detected_width = 1280
         self.detected_height = 720
@@ -169,6 +293,12 @@ def extract_boxes_grid(frame, detections, width, height, max_boxes=12, box_size=
         bbox = detection.get_bbox()
         confidence = detection.get_confidence()
         
+        # Get tracking ID
+        track_id = None
+        track = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
+        if len(track) == 1:
+            track_id = track[0].get_id()
+        
         # Get pixel coordinates from normalized coordinates [0, 1]
         x_min = int(bbox.xmin() * width)
         y_min = int(bbox.ymin() * height)
@@ -223,8 +353,11 @@ def extract_boxes_grid(frame, detections, width, height, max_boxes=12, box_size=
                          ((col + 1) * box_size - 1, (row + 1) * box_size - 1),
                          color, 2)
             
-            # Draw label
-            label_text = f"{label}: {confidence:.2f}"
+            # Draw label with tracking ID if available
+            if track_id is not None:
+                label_text = f"ID:{track_id} {label}: {confidence:.2f}"
+            else:
+                label_text = f"{label}: {confidence:.2f}"
             label_size, _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             label_y = row * box_size + 20
             
@@ -255,7 +388,16 @@ class user_app_callback_class(app_callback_class):
         self.confidence_threshold = 0.5
         self.frame_skip = 1
         self.file_path = "NOT_SPECIFIED"
+        self.display_scale = 1.0
+        
+        # Preview toggles
+        self.web_preview = False
+        self.gui_preview = True
+        self.display_preview = False
+        self.board = None
+        
         self.load_config()
+        self.setup_previews()
 
     def load_config(self):
         """Load configuration from config.json if present."""
@@ -267,9 +409,15 @@ class user_app_callback_class(app_callback_class):
                     self.show_boxes_only = config.get("show_boxes_only", False)
                     self.confidence_threshold = float(config.get("confidence_threshold", 0.5))
                     self.frame_skip = int(config.get("frame_skip", 1))
+                    self.display_scale = float(config.get("display_scale", 1.0))
                     
                     if "file_path" in config:
                         self.file_path = config["file_path"]
+                    
+                    # New preview toggles
+                    self.web_preview = config.get("web_preview", self.web_preview)
+                    self.gui_preview = config.get("gui_preview", self.gui_preview)
+                    self.display_preview = config.get("display_preview", self.display_preview)
                     
                     # Handle detection classes filtering
                     detection_classes = config.get("detection_classes", "all")
@@ -280,9 +428,24 @@ class user_app_callback_class(app_callback_class):
                         
                     print(f"✓ Config loaded: show_boxes_only={self.show_boxes_only}, "
                           f"confidence={self.confidence_threshold}, frame_skip={self.frame_skip}, "
-                          f"classes={detection_classes}, file_path={self.file_path}")
+                          f"scale={self.display_scale}, classes={detection_classes}, "
+                          f"web={self.web_preview}, gui={self.gui_preview}, display={self.display_preview}")
             except Exception as e:
                 print(f"⚠️  Failed to read config.json: {e}")
+
+    def setup_previews(self):
+        """Initialize web server and Whisplay if enabled."""
+        if self.web_preview:
+            threading.Thread(target=start_web_server, daemon=True).start()
+            
+        if self.display_preview and WhisPlayBoard is not None:
+            try:
+                self.board = WhisPlayBoard()
+                self.board.set_backlight(80)
+                print("✓ Whisplay display initialized!")
+            except Exception as e:
+                print(f"✗ Failed to initialize Whisplay: {e}")
+                self.display_preview = False
 
     def new_function(self):  # New function example
         return "The meaning of life is: "
@@ -351,55 +514,103 @@ def app_callback(pad, info, user_data):
         label = detection.get_label()
         bbox = detection.get_bbox()
         confidence = detection.get_confidence()
-        if label == "person":
-            # Get track ID
-            track_id = 0
-            track = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
-            if len(track) == 1:
-                track_id = track[0].get_id()
+        
+        # Get tracking ID for all detections
+        track_id = None
+        track = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
+        if len(track) == 1:
+            track_id = track[0].get_id()
+        
+        # Print detection info with tracking ID
+        if track_id is not None:
             string_to_print += (f"Detection: ID: {track_id} Label: {label} Confidence: {confidence:.2f}\n")
+        else:
+            string_to_print += (f"Detection: Label: {label} Confidence: {confidence:.2f}\n")
         detection_count += 1
         
     if user_data.use_frame and frame is not None:
-        # Handle "boxes only" preview mode or normal mode
-        if user_data.show_boxes_only:
-            # Create grid of cropped boxes
-            if user_data.get_count() % 30 == 0:
-                print(f"DEBUG: Grid mode active. Detections: {len(detections)}")
-            frame = extract_boxes_grid(frame, detections, width, height)
-        else:
-            if user_data.get_count() % 30 == 0:
-                print(f"DEBUG: Normal mode active. Detections: {len(detections)}")
-            # Normal mode: Draw bounding boxes on full frame
-            for detection in detections:
-                label = detection.get_label()
-                bbox = detection.get_bbox()
-                confidence = detection.get_confidence()
-                
-                x_min = int(bbox.xmin() * width)
-                y_min = int(bbox.ymin() * height)
-                w = int(bbox.width() * width)
-                h = int(bbox.height() * height)
-                x_max = x_min + w
-                y_max = y_min + h
-                
-                # Clamp coordinates
-                x_min = max(0, min(x_min, width))
-                y_min = max(0, min(y_min, height))
-                x_max = max(0, min(x_max, width))
-                y_max = max(0, min(y_max, height))
-                
-                cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-                cv2.putText(frame, f"{label}: {confidence:.2f}", (x_min, y_min - 10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-        # Print the detection count and other info to the frame
-        cv2.putText(frame, f"Detections: {detection_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(frame, f"{user_data.new_function()} {user_data.new_variable}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        # OPTIMIZATION: Only process frame if at least one preview is enabled
+        any_preview = user_data.gui_preview or user_data.web_preview or user_data.display_preview
         
-        # Convert the frame to BGR for display
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        user_data.set_frame(frame)
+        if any_preview:
+            # Handle "boxes only" preview mode or normal mode
+            if user_data.show_boxes_only:
+                # Create grid of cropped boxes
+                if user_data.get_count() % 30 == 0:
+                    print(f"DEBUG: Grid mode active. Detections: {len(detections)}")
+                frame = extract_boxes_grid(frame, detections, width, height)
+            else:
+                if user_data.get_count() % 30 == 0:
+                    print(f"DEBUG: Normal mode active. Detections: {len(detections)}")
+                # Normal mode: Draw bounding boxes on full frame
+                for detection in detections:
+                    label = detection.get_label()
+                    bbox = detection.get_bbox()
+                    confidence = detection.get_confidence()
+                    
+                    # Get tracking ID
+                    track_id = None
+                    track = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
+                    if len(track) == 1:
+                        track_id = track[0].get_id()
+                    
+                    x_min = int(bbox.xmin() * width)
+                    y_min = int(bbox.ymin() * height)
+                    w = int(bbox.width() * width)
+                    h = int(bbox.height() * height)
+                    x_max = x_min + w
+                    y_max = y_min + h
+                    
+                    # Clamp coordinates
+                    x_min = max(0, min(x_min, width))
+                    y_min = max(0, min(y_min, height))
+                    x_max = max(0, min(x_max, width))
+                    y_max = max(0, min(y_max, height))
+                    
+                    cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+                    
+                    # Build label with tracking ID if available
+                    if track_id is not None:
+                        label_text = f"ID:{track_id} {label}: {confidence:.2f}"
+                    else:
+                        label_text = f"{label}: {confidence:.2f}"
+                    
+                    cv2.putText(frame, label_text, (x_min, y_min - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            # Print the detection count and other info to the frame
+            cv2.putText(frame, f"Detections: {detection_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.putText(frame, f"{user_data.new_function()} {user_data.new_variable}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            
+            # Convert the frame to BGR for display
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            # Apply display scale if configured
+            if user_data.display_scale != 1.0:
+                h, w = frame.shape[:2]
+                new_w = int(w * user_data.display_scale)
+                new_h = int(h * user_data.display_scale)
+                if new_w > 0 and new_h > 0:
+                    frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            
+            # Update latest_frame for web streaming
+            if user_data.web_preview:
+                global latest_frame
+                with frame_lock:
+                    latest_frame = frame.copy()
+            
+            # Send to Whisplay
+            if user_data.display_preview and user_data.board:
+                try:
+                    pixel_data = image_to_rgb565(frame)
+                    user_data.board.draw_image(0, 0, WHISPLAY_WIDTH, WHISPLAY_HEIGHT, pixel_data)
+                except Exception as e:
+                    print(f"✗ Whisplay display error: {e}")
+                    user_data.display_preview = False
+            
+            # Set frame for local GUI if enabled
+            if user_data.gui_preview:
+                user_data.set_frame(frame)
 
     print(string_to_print)
     return Gst.PadProbeReturn.OK
@@ -417,6 +628,17 @@ if __name__ == "__main__":
     # Force use_frame to True so the preview window starts by default
     app.options_menu.use_frame = True
     user_data.use_frame = True
+    
+    # Patch display_user_data_frame to respect gui_preview
+    original_display = gstreamer_app.display_user_data_frame
+    def patched_display(ud):
+        if ud.gui_preview:
+            original_display(ud)
+        else:
+            while ud.running:
+                time.sleep(1)
+    
+    gstreamer_app.display_user_data_frame = patched_display
     
     app.run()
 

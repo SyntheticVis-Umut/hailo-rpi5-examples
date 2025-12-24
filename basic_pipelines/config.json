@@ -2,6 +2,10 @@
   "show_boxes_only": false,
   "detection_classes": "cat,person",
   "confidence_threshold": 0.75,
-  "frame_skip": 1,
-  "file_path": "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/resources/videos/example_640.mp4"
+  "frame_skip": 2,
+  "file_path": "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/resources/videos/example.mp4",
+  "web_preview": false,
+  "gui_preview": true,
+  "display_preview": false,
+  "display_scale": 1
 }
