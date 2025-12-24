@@ -1,5 +1,5 @@
 {
-  "show_boxes_only": false,
+  "show_boxes_only": true,
   "detection_classes": "cat,person",
   "confidence_threshold": 0.75,
   "frame_skip": 1,
