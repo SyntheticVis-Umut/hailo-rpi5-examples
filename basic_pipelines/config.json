@@ -1,7 +1,7 @@
 {
-  "show_boxes_only": true,
+  "show_boxes_only": false,
   "detection_classes": "cat,person",
-  "confidence_threshold": 0.75,
+  "confidence_threshold": 0.70,
   "frame_skip": 1,
   "file_path": null,
   "web_preview": false,
