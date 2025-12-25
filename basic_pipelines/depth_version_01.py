@@ -286,13 +286,14 @@ def app_callback(pad, info, user_data):
                 depth_norm = (255 * (depth_data - depth_min) / (depth_max - depth_min)).astype(np.uint8)
             else:
                 depth_norm = np.zeros((h, w), dtype=np.uint8)
-            # Color map (Magma or Jet is good for depth)
-            depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_MAGMA)
-            # Resize to preview size
-            depth_frame = cv2.resize(depth_color, (width, height), interpolation=cv2.INTER_LINEAR)
+            # Grayscale optimization: Skip ColorMap to save CPU
+            # Resize the 1-channel grayscale map first (faster)
+            depth_resized = cv2.resize(depth_norm, (width, height), interpolation=cv2.INTER_LINEAR)
+            # Convert to 3-channel BGR (simple channel copy) for preview consistency
+            depth_frame = cv2.cvtColor(depth_resized, cv2.COLOR_GRAY2BGR)
 
     if depth_frame is not None:
-        # Depth frame is already BGR from ColorMap
+        # Depth frame is now 3-channel BGR (Grayscale)
         if user_data.web_preview:
             global latest_frame
             with frame_lock: latest_frame = depth_frame.copy()
