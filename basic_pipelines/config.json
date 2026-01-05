@@ -1,14 +1,16 @@
 {
   "show_boxes_only": false,
   "detection_classes": "cat,person",
-  "confidence_threshold": 0.70,
+  "confidence_threshold": 0.60,
   "frame_skip": 1,
-  "file_path": null,
+  "file_path": "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/resources/videos/face_recognition.mp4",
+  "file_path_temp": "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/resources/videos/face_recognition.mp4",
   "web_preview": false,
   "gui_preview": true,
   "display_preview": false,
   "input_resolution": {
     "width": 640,
     "height": 480
-  }
+  },
+  "keep_pixelated_resolution": false
 }
