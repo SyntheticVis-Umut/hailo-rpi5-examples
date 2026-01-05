@@ -478,7 +478,9 @@ class user_app_callback_class(app_callback_class):
         self.board = None
         
         # Pixelation output resolution control
-        self.keep_pixelated_resolution = False  # If True, keep output at 64x48; if False, upscale back to original
+        self.keep_pixelated_resolution = False  # If True, keep output at pixelated resolution; if False, upscale back to original
+        self.pixelated_width = 64  # Default pixelation width
+        self.pixelated_height = 48  # Default pixelation height
         
         self.load_config()
         self.setup_previews()
@@ -511,6 +513,16 @@ class user_app_callback_class(app_callback_class):
                     # Pixelation output resolution control
                     self.keep_pixelated_resolution = config.get("keep_pixelated_resolution", False)
                     
+                    # Handle pixelated resolution from config
+                    pixelated_res = config.get("pixelated_resolution", {})
+                    if pixelated_res:
+                        self.pixelated_width = int(pixelated_res.get("width", 64))
+                        self.pixelated_height = int(pixelated_res.get("height", 48))
+                    else:
+                        # Use defaults if not specified
+                        self.pixelated_width = 64
+                        self.pixelated_height = 48
+                    
                     # Handle detection classes filtering
                     detection_classes = config.get("detection_classes", "all")
                     if isinstance(detection_classes, str) and detection_classes.strip().lower() != "all":
@@ -522,7 +534,8 @@ class user_app_callback_class(app_callback_class):
                           f"confidence={self.confidence_threshold}, frame_skip={self.frame_skip}, "
                           f"classes={detection_classes}, "
                           f"web={self.web_preview}, gui={self.gui_preview}, display={self.display_preview}, "
-                          f"keep_pixelated_resolution={self.keep_pixelated_resolution}")
+                          f"keep_pixelated_resolution={self.keep_pixelated_resolution}, "
+                          f"pixelated_resolution={self.pixelated_width}x{self.pixelated_height}")
                     if self.input_resolution_width and self.input_resolution_height:
                         print(f"  Input resolution override: {self.input_resolution_width}x{self.input_resolution_height}")
             except Exception as e:
@@ -614,8 +627,9 @@ def app_callback(pad, info, user_data):
     detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
 
     # Parse the detections (they are already filtered by filter_callback)
-    # Pre-extract tracking IDs and detection info to avoid repeated calls
+    # Pre-extract tracking IDs, masks, and detection info to avoid repeated calls
     detection_info = []
+    string_parts = []  # OPTIMIZATION: Use list for string building (faster than concatenation)
     for detection in detections:
         label = detection.get_label()
         bbox = detection.get_bbox()
@@ -627,13 +641,21 @@ def app_callback(pad, info, user_data):
         if len(track) == 1:
             track_id = track[0].get_id()
         
-        detection_info.append((detection, label, bbox, confidence, track_id))
+        # OPTIMIZATION: Pre-extract mask to avoid calling get_objects_typed in loop
+        masks = detection.get_objects_typed(hailo.HAILO_CONF_CLASS_MASK)
+        mask_obj = masks[0] if len(masks) > 0 else None
         
-        # Print detection info with tracking ID
+        detection_info.append((detection, label, bbox, confidence, track_id, mask_obj))
+        
+        # Build string parts for printing
         if track_id is not None:
-            string_to_print += (f"Segmentation: ID: {track_id} Label: {label} Confidence: {confidence:.2f}\n")
+            string_parts.append(f"Segmentation: ID: {track_id} Label: {label} Confidence: {confidence:.2f}")
         else:
-            string_to_print += (f"Segmentation: Label: {label} Confidence: {confidence:.2f}\n")
+            string_parts.append(f"Segmentation: Label: {label} Confidence: {confidence:.2f}")
+    
+    # OPTIMIZATION: Join string parts once (faster than concatenation)
+    if string_parts:
+        string_to_print += "\n".join(string_parts) + "\n"
         
     if user_data.use_frame and frame is not None:
         # Convert to BGR for OpenCV/Preview (GStreamer is now sending RGB)
@@ -657,17 +679,18 @@ def app_callback(pad, info, user_data):
                 if len(detection_info) == 0:
                     frame = masked_frame
                 else:
-                    # Constants for pixelation
-                    PIXELATED_WIDTH = 64
-                    PIXELATED_HEIGHT = 48
+                    # OPTIMIZATION: Pre-compute colors for all detections (avoid repeated modulo)
+                    colors_list = [COLORS[(track_id % len(COLORS)) if track_id is not None else idx % len(COLORS)]
+                                  for idx, (_, _, _, _, track_id, _) in enumerate(detection_info)]
                     
                     # Draw colored masks for each detection (using pre-extracted info)
-                    for idx, (detection, label, bbox, confidence, track_id) in enumerate(detection_info):
-                        masks = detection.get_objects_typed(hailo.HAILO_CONF_CLASS_MASK)
-                        if len(masks) == 0:
+                    # Masks will be drawn smoothly, then full frame pixelation will be applied
+                    for idx, (detection, label, bbox, confidence, track_id, mask_obj) in enumerate(detection_info):
+                        # OPTIMIZATION: Use pre-extracted mask (no need to call get_objects_typed again)
+                        if mask_obj is None:
                             continue
                         
-                        mask = masks[0]
+                        mask = mask_obj
                         mask_height = mask.get_height()
                         mask_width = mask.get_width()
                         
@@ -688,31 +711,24 @@ def app_callback(pad, info, user_data):
                         if x_max <= x_min or y_max <= y_min:
                             continue
                         
-                        # Get mask data and pixelate directly (optimized: single resize path)
+                        # Get mask data and resize directly to ROI size (smooth, no pixelation)
                         data = np.array(mask.get_data())
                         data = data.reshape((mask_height, mask_width))
                         
-                        # OPTIMIZATION: Pixelate directly from original mask size, then resize to ROI
-                        # This avoids intermediate resize operations
-                        # First pixelate the original mask
-                        pixelated_small = cv2.resize(data, (PIXELATED_WIDTH, PIXELATED_HEIGHT), 
-                                                    interpolation=cv2.INTER_NEAREST)
-                        # Threshold and convert to binary
-                        binary_pixelated = (pixelated_small > 0.5).astype(np.uint8)
-                        
-                        # Resize pixelated mask directly to ROI size (maintains pixelated look)
+                        # Resize mask directly to ROI size (smooth interpolation)
                         roi_h, roi_w = y_max - y_min, x_max - x_min
-                        pixelated_mask = cv2.resize(binary_pixelated, (roi_w, roi_h), 
-                                                   interpolation=cv2.INTER_NEAREST)
+                        resized_mask = cv2.resize(data, (roi_w, roi_h), interpolation=cv2.INTER_LINEAR)
                         
-                        # Select color based on tracking ID or index (already extracted)
-                        color = COLORS[(track_id % len(COLORS)) if track_id is not None else idx % len(COLORS)]
+                        # Threshold and convert to binary
+                        binary_mask = (resized_mask > 0.5).astype(np.uint8)
                         
-                        # OPTIMIZATION: Use broadcasting instead of creating intermediate arrays
-                        # Create colored mask directly using broadcasting
-                        pixelated_mask_3d = pixelated_mask[:, :, np.newaxis]
-                        # Use np.where for efficient conditional assignment
-                        colored_mask = np.where(pixelated_mask_3d > 0, color, 0).astype(np.uint8)
+                        # OPTIMIZATION: Use pre-computed color (no repeated calculation)
+                        color = colors_list[idx]
+                        
+                        # OPTIMIZATION: Use direct multiplication instead of np.where (faster)
+                        # Create colored mask using broadcasting and multiplication
+                        binary_mask_3d = binary_mask[:, :, np.newaxis]
+                        colored_mask = (binary_mask_3d * color).astype(np.uint8)
                         
                         # Draw colored mask on black background
                         # Use maximum to handle overlapping masks
@@ -723,25 +739,61 @@ def app_callback(pad, info, user_data):
                     # Replace frame with colored masks only (after all detections processed)
                     frame = masked_frame
             
-            # Pixelate the entire output frame to 64x48 (applies to both grid and normal modes)
-            OUTPUT_PIXELATED_WIDTH = 64
-            OUTPUT_PIXELATED_HEIGHT = 48
-            
+            # Pixelate the entire output frame (applies to both grid and normal modes)
             # Get original frame dimensions
             orig_h, orig_w = frame.shape[:2]
+            orig_aspect = orig_w / orig_h
             
-            # Downscale entire frame to low resolution
-            pixelated_frame = cv2.resize(frame, (OUTPUT_PIXELATED_WIDTH, OUTPUT_PIXELATED_HEIGHT), 
-                                       interpolation=cv2.INTER_NEAREST)
+            # Calculate pixelated dimensions maintaining aspect ratio
+            # Use the configured pixelated resolution as a base, but adjust to match input aspect ratio
+            config_pixel_w = user_data.pixelated_width
+            config_pixel_h = user_data.pixelated_height
+            config_aspect = config_pixel_w / config_pixel_h
             
-            # Conditionally upscale back to original size based on config
-            if user_data.keep_pixelated_resolution:
-                # Keep output at 64x48 (no upscale)
-                frame = pixelated_frame
+            # Check if aspect ratios match (within small tolerance)
+            aspect_match = abs(orig_aspect - config_aspect) < 0.01
+            
+            if aspect_match:
+                # Aspect ratios match, use configured resolution directly
+                OUTPUT_PIXELATED_WIDTH = config_pixel_w
+                OUTPUT_PIXELATED_HEIGHT = config_pixel_h
             else:
-                # Upscale back to original size using nearest neighbor to maintain pixelated look
-                frame = cv2.resize(pixelated_frame, (orig_w, orig_h), 
-                                  interpolation=cv2.INTER_NEAREST)
+                # Aspect ratios don't match - maintain input aspect ratio
+                # Scale based on the smaller dimension to fit within configured bounds
+                if orig_aspect > config_aspect:
+                    # Input is wider - scale based on height
+                    OUTPUT_PIXELATED_HEIGHT = config_pixel_h
+                    OUTPUT_PIXELATED_WIDTH = int(config_pixel_h * orig_aspect)
+                else:
+                    # Input is taller - scale based on width
+                    OUTPUT_PIXELATED_WIDTH = config_pixel_w
+                    OUTPUT_PIXELATED_HEIGHT = int(config_pixel_w / orig_aspect)
+                
+                # Warn user about aspect ratio mismatch
+                if not hasattr(user_data, '_aspect_warned'):
+                    print(f"⚠️  Aspect ratio mismatch detected!")
+                    print(f"   Input: {orig_w}x{orig_h} (aspect: {orig_aspect:.3f})")
+                    print(f"   Config pixelated: {config_pixel_w}x{config_pixel_h} (aspect: {config_aspect:.3f})")
+                    print(f"   Using: {OUTPUT_PIXELATED_WIDTH}x{OUTPUT_PIXELATED_HEIGHT} to maintain input aspect ratio")
+                    user_data._aspect_warned = True
+            
+            # OPTIMIZATION: Skip pixelation if resolution already matches (no resize needed)
+            if orig_w == OUTPUT_PIXELATED_WIDTH and orig_h == OUTPUT_PIXELATED_HEIGHT:
+                # Already at target resolution, no pixelation needed
+                pass
+            else:
+                # Downscale entire frame to low resolution
+                pixelated_frame = cv2.resize(frame, (OUTPUT_PIXELATED_WIDTH, OUTPUT_PIXELATED_HEIGHT), 
+                                           interpolation=cv2.INTER_NEAREST)
+                
+                # Conditionally upscale back to original size based on config
+                if user_data.keep_pixelated_resolution:
+                    # Keep output at pixelated resolution (no upscale)
+                    frame = pixelated_frame
+                else:
+                    # Upscale back to original size using nearest neighbor to maintain pixelated look
+                    frame = cv2.resize(pixelated_frame, (orig_w, orig_h), 
+                                      interpolation=cv2.INTER_NEAREST)
             
             # Update latest_frame for web streaming
             # OPTIMIZATION: Only copy if web preview is active
@@ -765,7 +817,7 @@ def app_callback(pad, info, user_data):
             if user_data.gui_preview:
                 user_data.set_frame(frame)
 
-    print(string_to_print)
+    #print(string_to_print)
     return Gst.PadProbeReturn.OK
 
 if __name__ == "__main__":

@@ -9,8 +9,12 @@
   "gui_preview": true,
   "display_preview": false,
   "input_resolution": {
-    "width": 640,
-    "height": 480
+    "width": 1280,
+    "height": 720
+  },
+  "pixelated_resolution": {
+    "width": 85,
+    "height": 48
   },
   "keep_pixelated_resolution": false
 }
