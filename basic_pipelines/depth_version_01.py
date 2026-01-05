@@ -158,6 +158,26 @@ class GStreamerDepthAppNoDisplay(GStreamerDepthApp):
         if input_source is None or str(input_source).lower() == "null": input_source = "rpi"
         
         parser.set_defaults(input=input_source)
+        
+        # Set default depth HEF path to fast_depth.hef if not provided via CLI
+        # Check if HEF path is provided via CLI, otherwise use config or default
+        cli_hef_path = getattr(temp_args, 'hef_path', None)
+        if not cli_hef_path or cli_hef_path == "None":
+            # Use depth_hef_path from config if available, otherwise use default fast_depth.hef
+            if user_data.depth_hef_path:
+                depth_hef_path = user_data.depth_hef_path
+            else:
+                # Default to fast_depth.hef in resources/models/hailo8l/
+                project_root = Path(__file__).resolve().parent.parent
+                default_depth_hef = project_root / "resources" / "models" / "hailo8l" / "fast_depth.hef"
+                depth_hef_path = str(default_depth_hef) if default_depth_hef.exists() else None
+            
+            if depth_hef_path:
+                parser.set_defaults(hef_path=depth_hef_path)
+                print(f"✓ Using depth model: {depth_hef_path}")
+            else:
+                print("⚠️  fast_depth.hef not found, will use CLI --hef-path if provided")
+        
         self.detected_width, self.detected_height = 1280, 720
         
         if input_source == "rpi":
@@ -219,6 +239,7 @@ class user_app_callback_class(app_callback_class):
         self.input_resolution_height = None
         self.web_preview, self.gui_preview, self.display_preview = False, True, False
         self.board = None
+        self.depth_hef_path = None  # Path to depth model HEF file
         self.load_config()
         self.setup_previews()
 
@@ -237,6 +258,24 @@ class user_app_callback_class(app_callback_class):
                     self.web_preview = config.get("web_preview", self.web_preview)
                     self.gui_preview = config.get("gui_preview", self.gui_preview)
                     self.display_preview = config.get("display_preview", self.display_preview)
+                    
+                    # Handle depth HEF path from config
+                    depth_config = config.get("depth", {})
+                    if depth_config:
+                        depth_path = depth_config.get("hef_path")
+                        if depth_path:
+                            # Resolve relative path
+                            if not os.path.isabs(depth_path):
+                                project_root = Path(__file__).resolve().parent.parent
+                                depth_path = project_root / depth_path
+                            else:
+                                depth_path = Path(depth_path)
+                            if depth_path.exists():
+                                self.depth_hef_path = str(depth_path)
+                                print(f"✓ Depth HEF path from config: {self.depth_hef_path}")
+                            else:
+                                print(f"⚠️  Depth HEF file not found: {depth_path}")
+                    
                     print(f"✓ Depth Config loaded: res={self.input_resolution_width}x{self.input_resolution_height}, previews=[web={self.web_preview}, gui={self.gui_preview}, display={self.display_preview}]")
             except Exception as e: print(f"⚠️  Config error: {e}")
 
@@ -277,20 +316,52 @@ def app_callback(pad, info, user_data):
         # Colorize depth for preview if needed
         needs_preview = user_data.gui_preview or user_data.web_preview or user_data.display_preview
         if needs_preview:
-            # Reshape based on model output (typically small)
-            h, w = depth_mask.get_height(), depth_mask.get_width()
+            # Reshape based on model output (typically 224x224 for fast_depth)
+            h, w = depth_mask.get_height(), depth_mask.get_width()  # Model output: 224x224 (square)
             depth_data = depth_data.reshape((h, w))
-            # Normalize to 0-255
-            depth_min, depth_max = depth_data.min(), depth_data.max()
-            if depth_max > depth_min:
-                depth_norm = (255 * (depth_data - depth_min) / (depth_max - depth_min)).astype(np.uint8)
+            
+            # Calculate letterboxing to handle aspect ratio mismatch
+            # Model expects 1:1 (square), but input might be different aspect ratio
+            input_aspect = width / height if height > 0 else 1.0
+            model_aspect = 1.0  # fast_depth is always square (224x224)
+            
+            # Calculate the actual content area in the model output (excluding letterboxing)
+            if abs(input_aspect - model_aspect) > 0.01:  # Aspect ratios don't match
+                # Input was letterboxed to fit square model input
+                # Calculate content area in 224x224 output
+                if input_aspect > model_aspect:
+                    # Input is wider (e.g., 16:9) - letterboxing on top/bottom
+                    # Content fills full width, but height is smaller
+                    content_h = int(w / input_aspect)  # Height of content in square output
+                    content_w = w  # Full width
+                    y_offset = (h - content_h) // 2  # Top padding
+                    x_offset = 0
+                else:
+                    # Input is taller (e.g., 9:16) - letterboxing on left/right
+                    # Content fills full height, but width is smaller
+                    content_w = int(h * input_aspect)  # Width of content in square output
+                    content_h = h  # Full height
+                    x_offset = (w - content_w) // 2  # Left padding
+                    y_offset = 0
+                
+                # Extract only the content area (excluding letterboxing)
+                depth_content = depth_data[y_offset:y_offset+content_h, x_offset:x_offset+content_w]
+                
+                # Resize content area to original input dimensions
+                depth_resized = cv2.resize(depth_content, (width, height), interpolation=cv2.INTER_LINEAR)
             else:
-                depth_norm = np.zeros((h, w), dtype=np.uint8)
-            # Grayscale optimization: Skip ColorMap to save CPU
-            # Resize the 1-channel grayscale map first (faster)
-            depth_resized = cv2.resize(depth_norm, (width, height), interpolation=cv2.INTER_LINEAR)
+                # Aspect ratios match (both square) - no letterboxing, resize directly
+                depth_resized = cv2.resize(depth_data, (width, height), interpolation=cv2.INTER_LINEAR)
+            
+            # Normalize to 0-255
+            depth_min, depth_max = depth_resized.min(), depth_resized.max()
+            if depth_max > depth_min:
+                depth_norm = (255 * (depth_resized - depth_min) / (depth_max - depth_min)).astype(np.uint8)
+            else:
+                depth_norm = np.zeros((height, width), dtype=np.uint8)
+            
             # Convert to 3-channel BGR (simple channel copy) for preview consistency
-            depth_frame = cv2.cvtColor(depth_resized, cv2.COLOR_GRAY2BGR)
+            depth_frame = cv2.cvtColor(depth_norm, cv2.COLOR_GRAY2BGR)
 
     if depth_frame is not None:
         # Depth frame is now 3-channel BGR (Grayscale)
