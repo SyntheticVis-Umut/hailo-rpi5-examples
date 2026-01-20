@@ -1,0 +1,294 @@
+(venv_hailo_rpi_examples) raspberrypi-user@raspberrypi:~/Desktop/hailo-rpi5-examples/basic_pipelines $ python art_segmentation.py 
+✓ Depth HEF path from config: /home/raspberrypi-user/Desktop/hailo-rpi5-examples/resources/models/hailo8l/fast_depth.hef
+✓ Segmentation Config loaded: show_boxes_only=False, confidence=0.6, frame_skip=1, classes=cat,person, web=False, gui=True, display=False, keep_pixelated_resolution=False, pixelated_resolution=64x48, depth_enabled=True
+  Input resolution override: 640x480
+✓ Using input source from config: rpi
+✓ Using RPi camera with input resolution override: 640x480
+Loading environment variables from /home/raspberrypi-user/Desktop/hailo-rpi5-examples/.env...
+✅ All required environment variables loaded.
+Auto-detected Hailo architecture: hailo8l
+🔍 [LOG] Step 1: Creating source pipeline...
+   ✓ Source pipeline type: <class 'str'>, length: 634
+   ✓ Source pipeline preview: appsrc name=app_source is-live=true leaky-type=downstream max-buffers=3 ! videoflip name=videoflip video-direction=horiz ! video/x-raw, format=RGB, wi
+🔍 [LOG] Step 2: Creating segmentation inference pipeline...
+   ✓ Inference pipeline type: <class 'str'>, value: queue name=segmentation_inference_scale_q leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0  ! videoscale name=segmentation_inference_videoscale n-threads=2 qos=false ! queue name=segmentat
+   ✓ Inference wrapper type: <class 'str'>, length: 1966
+   ✓ Inference wrapper preview: queue name=segmentation_inference_wrapper_input_q leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0  ! hailocropper name=segmentation_inference_wrapper_crop so-path=/usr/lib/aarch64-linux-g
+🔍 [LOG] Step 2b: Creating depth inference pipeline...
+   ✓ Detected fast_depth model - skipping post-processing
+   ✓ Depth inference pipeline type: <class 'str'>, value: queue name=depth_inference_scale_q leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0  ! videoscale name=depth_inference_videoscale n-threads=2 qos=false ! queue name=depth_inference_convert
+   ✓ Depth wrapper type: <class 'str'>, length: 1542
+✓ Depth inference pipeline configured with HEF: /home/raspberrypi-user/Desktop/hailo-rpi5-examples/resources/models/hailo8l/fast_depth.hef
+🔍 [LOG] Step 3: Creating tracker pipeline...
+   ✓ Tracker pipeline: hailotracker name=hailo_tracker class-id=1 kalman-dist-thr=0.8 iou-thr=0.9 init-iou-thr=0.7 keep-new-frames=2 keep-tracked-frames=15 keep-lost-frames=
+🔍 [LOG] Step 4: Creating filter pipeline...
+   ✓ Filter pipeline: queue name=filter_q leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0  ! identity name=identity_filter
+🔍 [LOG] Step 5: Creating overlay pipeline...
+   ✓ Overlay pipeline: queue name=hailo_overlay_q leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0  ! hailooverlay
+🔍 [LOG] Step 6: Building final pipeline string...
+   → Building pipeline WITH depth (depth_wrapper → depth_extractor → queue → segmentation)
+✓ Pipeline configured with sequential depth inference (before segmentation)
+   Note: Using depth inference wrapper (like depth_version_01.py) to properly attach depth metadata
+🔍 [LOG] Final pipeline string length: 5278
+🔍 [LOG] Final pipeline preview (first 500 chars):
+appsrc name=app_source is-live=true leaky-type=downstream max-buffers=3 ! videoflip name=videoflip video-direction=horiz ! video/x-raw, format=RGB, width=640, height=480 !  queue name=source_scale_q leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0  ! videoscale name=source_videoscale n-threads=2 ! queue name=source_convert_q leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0  ! videoconvert n-threads=3 name=source_convert qos=false ! video/x-raw, pixel-aspect-ratio=1/1, for
+🔍 [LOG] Final pipeline preview (last 500 chars):
+rlay ! queue name=preview_scale_q leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0  ! videoscale name=preview_videoscale ! video/x-raw, width=640, height=480 ! queue name=preview_convert_q leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0  ! videoconvert name=preview_videoconvert ! video/x-raw, format=RGB ! queue name=identity_callback_q leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0  ! identity name=identity_callback  ! fakesink name=hailo_display sync=false
+🔍 [LOG] Pipeline string construction complete. Returning to GStreamer...
+✓ Hardware filter connected (filtering before box overlay)
+✓ Depth extraction callback connected on depth_extractor (extracting depth after inference, before segmentation)
+[1:38:49.445092639] [80737]  INFO Camera camera_manager.cpp:330 libcamera v0.5.2+99-bfd68f78
+[1:38:49.454310250] [80747]  INFO RPI pisp.cpp:720 libpisp version v1.2.1 981977ff21f3 29-04-2025 (14:13:50)
+[1:38:49.457159071] [80747]  INFO IPAProxy ipa_proxy.cpp:180 Using tuning file /usr/share/libcamera/ipa/rpi/pisp/imx500.json
+[1:38:49.464199215] [80747]  INFO Camera camera_manager.cpp:220 Adding camera '/base/axi/pcie@1000120000/rp1/i2c@88000/imx500@1a' for pipeline handler rpi/pisp
+[1:38:49.464247344] [80747]  INFO RPI pisp.cpp:1179 Registered camera /base/axi/pcie@1000120000/rp1/i2c@88000/imx500@1a to CFE device /dev/media0 and ISP device /dev/media1 using PiSP variant BCM2712_D0
+[1:38:49.470337134] [80737]  INFO Camera camera.cpp:1215 configuring streams: (0) 640x480-RGB888/sRGB (1) 640x480-RGB888/sRGB (2) 2028x1520-RGGB_PISP_COMP1/RAW
+[1:38:49.470468468] [80747]  INFO RPI pisp.cpp:1483 Sensor: /base/axi/pcie@1000120000/rp1/i2c@88000/imx500@1a - Selected sensor format: 2028x1520-SRGGB10_1X10/RAW - Selected CFE format: 2028x1520-PC1R/RAW
+Patched Picamera2 configuration: width=640, height=480, format=RGB
+🔍 [DEPTH EXTRACT] Frame 1:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+⚠️  Depth extraction callback: no depth masks found in ROI
+🔍 [MAIN CALLBACK] Frame 1: Checking depth...
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  Depth enabled but depth_data_cache is None - depth extraction callback may not be working
+⚠️  [BLEND] Frame 1: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+⚠️  [BLEND] Depth enabled but depth_data_full is None - blending skipped
+   depth_data_cache is None: True
+🔍 [DEPTH EXTRACT] Frame 2:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+🔍 [DEPTH EXTRACT] Frame 3:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+🔍 [MAIN CALLBACK] Frame 2: Checking depth...
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  [BLEND] Frame 2: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+🔍 [MAIN CALLBACK] Frame 3: Checking depth...
+🔍 [DEPTH EXTRACT] Frame 4:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  [BLEND] Frame 3: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+🔍 [DEPTH EXTRACT] Frame 5:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+🔍 [MAIN CALLBACK] Frame 4: Checking depth...
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  [BLEND] Frame 4: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+🔍 [MAIN CALLBACK] Frame 5: Checking depth...
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  [BLEND] Frame 5: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+🔍 [DEPTH EXTRACT] Frame 6:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+🔍 [DEPTH EXTRACT] Frame 7:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+🔍 [MAIN CALLBACK] Frame 6: Checking depth...
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  [BLEND] Frame 6: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+🔍 [DEPTH EXTRACT] Frame 8:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+🔍 [MAIN CALLBACK] Frame 7: Checking depth...
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  [BLEND] Frame 7: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+🔍 [DEPTH EXTRACT] Frame 9:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+🔍 [MAIN CALLBACK] Frame 8: Checking depth...
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  [BLEND] Frame 8: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+🔍 [DEPTH EXTRACT] Frame 10:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+🔍 [MAIN CALLBACK] Frame 9: Checking depth...
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  [BLEND] Frame 9: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+🔍 [MAIN CALLBACK] Frame 10: Checking depth...
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  [BLEND] Frame 10: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+🔍 [DEPTH EXTRACT] Frame 30:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+🔍 [MAIN CALLBACK] Frame 30: Checking depth...
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  [BLEND] Frame 30: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+🔍 [DEPTH EXTRACT] Frame 60:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+🔍 [MAIN CALLBACK] Frame 60: Checking depth...
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  [BLEND] Frame 60: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+🔍 [DEPTH EXTRACT] Frame 90:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+🔍 [MAIN CALLBACK] Frame 90: Checking depth...
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  [BLEND] Frame 90: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+🔍 [DEPTH EXTRACT] Frame 120:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+🔍 [MAIN CALLBACK] Frame 120: Checking depth...
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  [BLEND] Frame 120: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+🔍 [DEPTH EXTRACT] Frame 150:
+   ROI type: <class 'hailo.HailoROI'>
+   Depth masks found (recursive search): 0
+   Total objects in top-level ROI: 0
+   Error getting objects: module 'hailo' has no attribute 'HAILO_MASK'
+Traceback (most recent call last):
+  File "/home/raspberrypi-user/Desktop/hailo-rpi5-examples/basic_pipelines/art_segmentation.py", line 786, in depth_extraction_callback
+    mask_count = len(roi.get_objects_typed(hailo.HAILO_MASK))
+                                           ^^^^^^^^^^^^^^^^
+AttributeError: module 'hailo' has no attribute 'HAILO_MASK'
+🔍 [MAIN CALLBACK] Frame 150: Checking depth...
+   depth_enabled: True
+   depth_data_cache is None: True
+⚠️  [BLEND] Frame 150: Depth enabled but depth_data_full is None!
+   depth_data_cache is None: True
+   depth_enabled: True
+^CShutting down... Hit Ctrl-C again to force quit.
+Shutting down... Hit Ctrl-C again to force quit.
+Segmentation fault

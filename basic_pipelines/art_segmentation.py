@@ -123,6 +123,12 @@ def patched_picamera_thread(pipeline, video_width, video_height, video_format, p
     appsrc = pipeline.get_by_name("app_source")
     appsrc.set_property("is-live", True)
     appsrc.set_property("format", Gst.Format.TIME)
+    # Limit queue size to prevent buffer accumulation and increasing delay
+    # max-bytes: maximum bytes in queue (roughly 2-3 frames at 1280x720 RGB)
+    frame_bytes = video_width * video_height * 3  # RGB = 3 bytes per pixel
+    appsrc.set_property("max-bytes", frame_bytes * 3)  # Allow max 3 frames in queue
+    appsrc.set_property("max-buffers", 3)  # Max 3 buffers in queue
+    # Note: leaky-type=downstream is set in the pipeline string to drop old buffers when queue is full
     
     with Picamera2() as picam2:
         if picamera_config is None:
@@ -148,22 +154,48 @@ def patched_picamera_thread(pipeline, video_width, video_height, video_format, p
         )
         picam2.start()
         frame_count = 0
+        import time
+        last_frame_time = time.time()
+        target_frame_time = 1.0 / 30.0  # 30 FPS target
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        
         while True:
+            # Throttle frame rate to prevent buffer accumulation
+            current_time = time.time()
+            elapsed = current_time - last_frame_time
+            if elapsed < target_frame_time:
+                time.sleep(target_frame_time - elapsed)
+            last_frame_time = time.time()
+            
             frame_data = picam2.capture_array('lores')
             if frame_data is None:
                 break
             # Convert BGR to RGB
             frame = cv2.cvtColor(frame_data, cv2.COLOR_BGR2RGB)
+            # Flip frame horizontally to fix upside-down camera
+            frame = cv2.flip(frame, -1)  # -1 = flip both horizontally and vertically (rotate 180)
             frame = np.asarray(frame)
             buffer = Gst.Buffer.new_wrapped(frame.tobytes())
             buffer_duration = Gst.util_uint64_scale_int(1, Gst.SECOND, 30)
             buffer.pts = frame_count * buffer_duration
             buffer.duration = buffer_duration
             ret = appsrc.emit('push-buffer', buffer)
+            
             if ret == Gst.FlowReturn.FLUSHING:
                 break
-            if ret != Gst.FlowReturn.OK:
-                break
+            elif ret != Gst.FlowReturn.OK:
+                # Pipeline is full or error occurred, wait a bit before trying again
+                # This handles backpressure when the pipeline can't keep up
+                consecutive_errors += 1
+                if consecutive_errors > max_consecutive_errors:
+                    print(f"⚠️  Pipeline backpressure (ret={ret}), dropping frame {frame_count}")
+                    consecutive_errors = 0
+                time.sleep(0.01)  # Small delay to let pipeline catch up
+                continue
+            
+            # Reset error counter on success
+            consecutive_errors = 0
             frame_count += 1
 
 # Apply the patch
@@ -250,28 +282,92 @@ class GStreamerInstanceSegmentationAppNoDisplay(GStreamerInstanceSegmentationApp
         self.video_height = self.detected_height
         
         # 1. Source (Hardware Scaling to input_resolution happens here)
+        print("🔍 [LOG] Step 1: Creating source pipeline...")
         source_pipeline = SOURCE_PIPELINE(video_source=self.video_source,
                                           video_width=self.video_width, video_height=self.video_height,
                                           frame_rate=self.frame_rate, sync=self.sync)
         
-        # 2. Inference
+        # Note: Camera flip is handled in patched_picamera_thread using cv2.flip
+        # This ensures the flip happens at the source for appsrc-based pipelines
+        
+        print(f"   ✓ Source pipeline type: {type(source_pipeline)}, length: {len(source_pipeline) if isinstance(source_pipeline, str) else 'N/A'}")
+        print(f"   ✓ Source pipeline preview: {source_pipeline[:150] if isinstance(source_pipeline, str) else str(source_pipeline)[:150]}")
+        
+        # 2. Segmentation Inference
+        print("🔍 [LOG] Step 2: Creating segmentation inference pipeline...")
         inference_pipeline = INFERENCE_PIPELINE(
             hef_path=self.hef_path,
             post_process_so=self.post_process_so,
             post_function_name=self.post_function_name,
             batch_size=self.batch_size,
-            config_json=self.config_file
+            config_json=self.config_file,
+            name='segmentation_inference'
         )
-        inference_pipeline_wrapper = INFERENCE_PIPELINE_WRAPPER(inference_pipeline)
+        print(f"   ✓ Inference pipeline type: {type(inference_pipeline)}, value: {str(inference_pipeline)[:200]}")
+        inference_pipeline_wrapper = INFERENCE_PIPELINE_WRAPPER(inference_pipeline, name='segmentation_inference_wrapper')
+        print(f"   ✓ Inference wrapper type: {type(inference_pipeline_wrapper)}, length: {len(inference_pipeline_wrapper) if isinstance(inference_pipeline_wrapper, str) else 'N/A'}")
+        print(f"   ✓ Inference wrapper preview: {inference_pipeline_wrapper[:200] if isinstance(inference_pipeline_wrapper, str) else str(inference_pipeline_wrapper)[:200]}")
+        
+        # 2b. Depth Inference (if depth HEF path is available) - Sequential after segmentation
+        depth_inference_wrapper = None
+        depth_inference_pipeline_direct = None
+        if self.user_data.depth_enabled and self.user_data.depth_hef_path:
+            print("🔍 [LOG] Step 2b: Creating depth inference pipeline...")
+            try:
+                # Check if using fast_depth.hef - it doesn't need post-processing
+                # libdepth_postprocess.so is only for scdepthv3
+                depth_hef_name = Path(self.user_data.depth_hef_path).name.lower()
+                is_fast_depth = "fast_depth" in depth_hef_name
+                
+                if is_fast_depth:
+                    print(f"   ✓ Detected fast_depth model - skipping post-processing")
+                    depth_post_so_str = None
+                    depth_post_function = None
+                else:
+                    # For scdepthv3, use post-processing
+                    project_root = Path(__file__).resolve().parent.parent
+                    depth_post_so = project_root / "resources" / "so" / "libdepth_postprocess.so"
+                    depth_post_so_str = str(depth_post_so) if depth_post_so.exists() else None
+                    depth_post_function = "filter" if depth_post_so_str else None
+                    print(f"   ✓ Depth post-process SO: {depth_post_so_str}")
+                
+                # Use depth inference pipeline with wrapper (like depth_version_01.py)
+                # The wrapper is needed for proper metadata attachment
+                # Even though hailocropper is in the wrapper, depth metadata should still be at top-level ROI
+                depth_inference_pipeline = INFERENCE_PIPELINE(
+                    hef_path=self.user_data.depth_hef_path,
+                    post_process_so=depth_post_so_str,
+                    post_function_name=depth_post_function,
+                    batch_size=self.batch_size,
+                    name='depth_inference'
+                )
+                depth_inference_wrapper = INFERENCE_PIPELINE_WRAPPER(depth_inference_pipeline, name='depth_inference_wrapper')
+                depth_inference_pipeline_direct = None  # Use wrapper instead
+                print(f"   ✓ Depth inference pipeline type: {type(depth_inference_pipeline)}, value: {str(depth_inference_pipeline)[:200]}")
+                print(f"   ✓ Depth wrapper type: {type(depth_inference_wrapper)}, length: {len(depth_inference_wrapper) if isinstance(depth_inference_wrapper, str) else 'N/A'}")
+                print(f"✓ Depth inference pipeline configured with HEF: {self.user_data.depth_hef_path}")
+            except Exception as e:
+                print(f"⚠️  Failed to configure depth inference pipeline: {e}")
+                import traceback
+                traceback.print_exc()
+                depth_inference_wrapper = None
+                depth_inference_pipeline_direct = None
+                self.user_data.depth_enabled = False
         
         # 3. Tracker
+        print("🔍 [LOG] Step 3: Creating tracker pipeline...")
         tracker_pipeline = TRACKER_PIPELINE(class_id=1)
+        print(f"   ✓ Tracker pipeline: {tracker_pipeline[:150] if isinstance(tracker_pipeline, str) else str(tracker_pipeline)[:150]}")
         
         # 4. Hardware Filter (Python Callback to remove unwanted detections)
+        print("🔍 [LOG] Step 4: Creating filter pipeline...")
         filter_pipeline = f"{QUEUE(name='filter_q')} ! identity name=identity_filter"
+        print(f"   ✓ Filter pipeline: {filter_pipeline}")
         
         # 5. Hardware Overlay (Box Drawing) - Faster than Python
+        print("🔍 [LOG] Step 5: Creating overlay pipeline...")
         overlay_pipeline = f"{QUEUE(name='hailo_overlay_q')} ! hailooverlay"
+        print(f"   ✓ Overlay pipeline: {overlay_pipeline}")
         
         # 6. Hardware Scaling & Conversion (Only include if pixels are needed)
         needs_frame = self.user_data.gui_preview or self.user_data.web_preview or self.user_data.display_preview or self.user_data.show_boxes_only
@@ -299,16 +395,47 @@ class GStreamerInstanceSegmentationAppNoDisplay(GStreamerInstanceSegmentationApp
         # 8. Hardware Sink (fakesink to suppress second window)
         sink_pipeline = f"fakesink name=hailo_display sync={self.sync}"
 
-        pipeline_string = (
-            f'{source_pipeline} ! '
-            f'{inference_pipeline_wrapper} ! '
-            f'{tracker_pipeline} ! '
-            f'{filter_pipeline} ! '
-            f'{overlay_pipeline} '
-            f'{hardware_post_proc} ! '
-            f'{user_callback_pipeline} ! '
-            f'{sink_pipeline}'
-        )
+        # Build pipeline string - run depth BEFORE segmentation so depth processes raw video
+        # Check if depth metadata persists through segmentation and can be accessed in main callback
+        print("🔍 [LOG] Step 6: Building final pipeline string...")
+        if depth_inference_wrapper is not None:
+            # Fallback: use wrapper if direct pipeline not available
+            print("   → Building pipeline WITH depth (depth → depth_extractor → queue → segmentation)")
+            depth_extractor = f"identity name=depth_extractor"
+            intermediate_queue = QUEUE(name='depth_to_segmentation_q')
+            pipeline_string = (
+                f'{source_pipeline} ! '
+                f'{depth_inference_wrapper} ! '
+                f'{depth_extractor} ! '
+                f'{intermediate_queue} ! '
+                f'{inference_pipeline_wrapper} ! '
+                f'{tracker_pipeline} ! '
+                f'{filter_pipeline} ! '
+                f'{overlay_pipeline} '
+                f'{hardware_post_proc} ! '
+                f'{user_callback_pipeline} ! '
+                f'{sink_pipeline}'
+            )
+            print(f"✓ Pipeline configured with sequential depth inference (before segmentation)")
+            print(f"   Note: Depth metadata should persist in buffer and be accessible in main callback")
+        else:
+            # Standard pipeline without depth
+            print("   → Building pipeline WITHOUT depth")
+            pipeline_string = (
+                f'{source_pipeline} ! '
+                f'{inference_pipeline_wrapper} ! '
+                f'{tracker_pipeline} ! '
+                f'{filter_pipeline} ! '
+                f'{overlay_pipeline} '
+                f'{hardware_post_proc} ! '
+                f'{user_callback_pipeline} ! '
+                f'{sink_pipeline}'
+            )
+        
+        print(f"🔍 [LOG] Final pipeline string length: {len(pipeline_string)}")
+        print(f"🔍 [LOG] Final pipeline preview (first 500 chars):\n{pipeline_string[:500]}")
+        print(f"🔍 [LOG] Final pipeline preview (last 500 chars):\n{pipeline_string[-500:]}")
+        print("🔍 [LOG] Pipeline string construction complete. Returning to GStreamer...")
         return pipeline_string
 
 # -----------------------------------------------------------------------------------------------
@@ -482,6 +609,13 @@ class user_app_callback_class(app_callback_class):
         self.pixelated_width = 64  # Default pixelation width
         self.pixelated_height = 48  # Default pixelation height
         
+        # Depth integration
+        self.depth_hef_path = None  # Path to depth model HEF file
+        self.depth_enabled = False  # Whether depth processing is enabled
+        self.depth_data_cache = None  # Cache for depth data extracted before segmentation
+        self.depth_min_cache = 0
+        self.depth_max_cache = 1
+        
         self.load_config()
         self.setup_previews()
 
@@ -523,6 +657,32 @@ class user_app_callback_class(app_callback_class):
                         self.pixelated_width = 64
                         self.pixelated_height = 48
                     
+                    # Handle depth configuration
+                    depth_config = config.get("depth", {})
+                    if depth_config:
+                        depth_path = depth_config.get("hef_path")
+                        if depth_path:
+                            # Resolve relative path
+                            if not os.path.isabs(depth_path):
+                                project_root = Path(__file__).resolve().parent.parent
+                                depth_path = project_root / depth_path
+                            else:
+                                depth_path = Path(depth_path)
+                            if depth_path.exists():
+                                self.depth_hef_path = str(depth_path)
+                                self.depth_enabled = True
+                                print(f"✓ Depth HEF path from config: {self.depth_hef_path}")
+                            else:
+                                print(f"⚠️  Depth HEF file not found: {depth_path}")
+                        else:
+                            # Try default fast_depth.hef location
+                            project_root = Path(__file__).resolve().parent.parent
+                            default_depth_hef = project_root / "resources" / "models" / "hailo8l" / "fast_depth.hef"
+                            if default_depth_hef.exists():
+                                self.depth_hef_path = str(default_depth_hef)
+                                self.depth_enabled = True
+                                print(f"✓ Using default depth model: {self.depth_hef_path}")
+                    
                     # Handle detection classes filtering
                     detection_classes = config.get("detection_classes", "all")
                     if isinstance(detection_classes, str) and detection_classes.strip().lower() != "all":
@@ -535,7 +695,8 @@ class user_app_callback_class(app_callback_class):
                           f"classes={detection_classes}, "
                           f"web={self.web_preview}, gui={self.gui_preview}, display={self.display_preview}, "
                           f"keep_pixelated_resolution={self.keep_pixelated_resolution}, "
-                          f"pixelated_resolution={self.pixelated_width}x{self.pixelated_height}")
+                          f"pixelated_resolution={self.pixelated_width}x{self.pixelated_height}, "
+                          f"depth_enabled={self.depth_enabled}")
                     if self.input_resolution_width and self.input_resolution_height:
                         print(f"  Input resolution override: {self.input_resolution_width}x{self.input_resolution_height}")
             except Exception as e:
@@ -558,6 +719,69 @@ class user_app_callback_class(app_callback_class):
 # -----------------------------------------------------------------------------------------------
 # User-defined callback function
 # -----------------------------------------------------------------------------------------------
+
+def depth_extraction_callback(pad, info, user_data):
+    """Extract depth data right after depth inference, before segmentation processes it."""
+    buffer = info.get_buffer()
+    if buffer is None:
+        return Gst.PadProbeReturn.OK
+    
+    # Only extract if depth is enabled
+    if not user_data.depth_enabled:
+        return Gst.PadProbeReturn.OK
+    
+    # Get the ROI from the buffer (this should have depth data from depth inference)
+    roi = hailo.get_roi_from_buffer(buffer)
+    depth_masks = roi.get_objects_typed(hailo.HAILO_DEPTH_MASK)
+    
+    # Detailed debug logging (first few frames)
+    if not hasattr(user_data, '_depth_extraction_frame_count'):
+        user_data._depth_extraction_frame_count = 0
+    
+    user_data._depth_extraction_frame_count += 1
+    
+    if user_data._depth_extraction_frame_count <= 5:
+        print(f"🔍 [DEPTH EXTRACT] Frame {user_data._depth_extraction_frame_count}:")
+        print(f"   ROI type: {type(roi)}")
+        print(f"   Depth masks found: {len(depth_masks)}")
+        
+        # Check all objects in ROI
+        try:
+            all_objects = roi.get_objects()
+            print(f"   Total objects in ROI: {len(all_objects)}")
+            for idx, obj in enumerate(all_objects[:3]):
+                obj_type = type(obj).__name__
+                obj_depth = obj.get_objects_typed(hailo.HAILO_DEPTH_MASK)
+                print(f"     Object {idx}: {obj_type}, depth masks: {len(obj_depth)}")
+        except Exception as e:
+            print(f"   Error getting objects: {e}")
+    
+    if len(depth_masks) > 0:
+        depth_mask = depth_masks[0]
+        depth_data = np.array(depth_mask.get_data())
+        depth_h = depth_mask.get_height()
+        depth_w = depth_mask.get_width()
+        depth_data = depth_data.reshape((depth_h, depth_w))
+        
+        # Cache the raw depth data (we'll resize it later in the main callback)
+        user_data.depth_data_cache = depth_data
+        user_data.depth_min_cache = depth_data.min()
+        user_data.depth_max_cache = depth_data.max()
+        if user_data.depth_max_cache <= user_data.depth_min_cache:
+            user_data.depth_max_cache = user_data.depth_min_cache + 1
+        
+        # Debug logging (first frame only)
+        if not hasattr(user_data, '_depth_extraction_logged'):
+            print(f"✓ Depth extraction callback: extracted {depth_h}x{depth_w} depth data")
+            print(f"   Depth range: min={user_data.depth_min_cache:.3f}, max={user_data.depth_max_cache:.3f}")
+            user_data._depth_extraction_logged = True
+    else:
+        # Debug logging (first frame only)
+        if not hasattr(user_data, '_depth_extraction_logged'):
+            print(f"⚠️  Depth extraction callback: no depth masks found in ROI")
+            user_data._depth_extraction_logged = True
+    
+    return Gst.PadProbeReturn.OK
 
 def filter_callback(pad, info, user_data):
     """Filter detections in hardware ROI before they reach the overlay."""
@@ -625,6 +849,81 @@ def app_callback(pad, info, user_data):
     # Get the detections from the buffer
     roi = hailo.get_roi_from_buffer(buffer)
     detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
+    
+    # Get depth data if depth is enabled
+    # First try cached data from depth extraction callback, then try to get from ROI directly
+    depth_data_full = None
+    depth_min = 0
+    depth_max = 1
+    
+    # Try to get depth from ROI directly (in case it persists through the pipeline)
+    if user_data.depth_enabled:
+        roi_depth_masks = roi.get_objects_typed(hailo.HAILO_DEPTH_MASK)
+        if len(roi_depth_masks) > 0 and user_data.depth_data_cache is None:
+            # Found depth in ROI but not in cache - extract it now
+            depth_mask = roi_depth_masks[0]
+            depth_data = np.array(depth_mask.get_data())
+            depth_h = depth_mask.get_height()
+            depth_w = depth_mask.get_width()
+            depth_data = depth_data.reshape((depth_h, depth_w))
+            user_data.depth_data_cache = depth_data
+            user_data.depth_min_cache = depth_data.min()
+            user_data.depth_max_cache = depth_data.max()
+            if user_data.depth_max_cache <= user_data.depth_min_cache:
+                user_data.depth_max_cache = user_data.depth_min_cache + 1
+            if not hasattr(user_data, '_depth_found_in_main_callback'):
+                print(f"✓ [MAIN CALLBACK] Found depth in ROI: {depth_h}x{depth_w}")
+                user_data._depth_found_in_main_callback = True
+    
+    if user_data.depth_enabled and user_data.depth_data_cache is not None:
+        depth_data = user_data.depth_data_cache
+        depth_h, depth_w = depth_data.shape
+        
+        # Handle letterboxing for fast_depth (outputs square 224x224, but input may not be square)
+        if format is not None and width is not None and height is not None:
+            input_aspect = width / height if height > 0 else 1.0
+            model_aspect = 1.0  # fast_depth is always square (224x224)
+            
+            # Calculate the actual content area in the model output (excluding letterboxing)
+            if abs(input_aspect - model_aspect) > 0.01:  # Aspect ratios don't match
+                # Input was letterboxed to fit square model input
+                if input_aspect > model_aspect:
+                    # Input is wider (e.g., 16:9) - letterboxing on top/bottom
+                    content_h = int(depth_w / input_aspect)  # Height of content in square output
+                    content_w = depth_w  # Full width
+                    y_offset = (depth_h - content_h) // 2  # Top padding
+                    x_offset = 0
+                else:
+                    # Input is taller (e.g., 9:16) - letterboxing on left/right
+                    content_w = int(depth_h * input_aspect)  # Width of content in square output
+                    content_h = depth_h  # Full height
+                    x_offset = (depth_w - content_w) // 2  # Left padding
+                    y_offset = 0
+                
+                # Extract only the content area (excluding letterboxing)
+                depth_content = depth_data[y_offset:y_offset+content_h, x_offset:x_offset+content_w]
+                
+                # Resize content area to original input dimensions
+                depth_data_full = cv2.resize(depth_content, (width, height), interpolation=cv2.INTER_LINEAR)
+            else:
+                # Aspect ratios match (both square) - no letterboxing, resize directly
+                depth_data_full = cv2.resize(depth_data, (width, height), interpolation=cv2.INTER_LINEAR)
+            
+            depth_min = user_data.depth_min_cache
+            depth_max = user_data.depth_max_cache
+            
+            # Debug logging (first frame only)
+            if not hasattr(user_data, '_depth_usage_logged'):
+                print(f"✓ Using cached depth data: model output={depth_h}x{depth_w}, resized to {width}x{height}")
+                print(f"   Depth range: min={depth_min:.3f}, max={depth_max:.3f}")
+                if abs(input_aspect - model_aspect) > 0.01:
+                    print(f"   Letterboxing handled: extracted {content_h}x{content_w} from {depth_h}x{depth_w}")
+                user_data._depth_usage_logged = True
+    elif user_data.depth_enabled and user_data.depth_data_cache is None:
+        # Debug logging (first frame only)
+        if not hasattr(user_data, '_depth_usage_logged'):
+            print(f"⚠️  Depth enabled but depth_data_cache is None - depth extraction callback may not be working")
+            user_data._depth_usage_logged = True
 
     # Parse the detections (they are already filtered by filter_callback)
     # Pre-extract tracking IDs, masks, and detection info to avoid repeated calls
@@ -780,20 +1079,82 @@ def app_callback(pad, info, user_data):
             # OPTIMIZATION: Skip pixelation if resolution already matches (no resize needed)
             if orig_w == OUTPUT_PIXELATED_WIDTH and orig_h == OUTPUT_PIXELATED_HEIGHT:
                 # Already at target resolution, no pixelation needed
-                pass
+                pixelated_frame = frame.copy()
             else:
                 # Downscale entire frame to low resolution
                 pixelated_frame = cv2.resize(frame, (OUTPUT_PIXELATED_WIDTH, OUTPUT_PIXELATED_HEIGHT), 
                                            interpolation=cv2.INTER_NEAREST)
+            
+            # Blend depth with pixelated masks if depth is enabled
+            if user_data.depth_enabled and depth_data_full is not None:
+                # Pixelate depth to match pixelated frame resolution
+                pixelated_depth = cv2.resize(depth_data_full, (OUTPUT_PIXELATED_WIDTH, OUTPUT_PIXELATED_HEIGHT), 
+                                            interpolation=cv2.INTER_NEAREST)
                 
-                # Conditionally upscale back to original size based on config
-                if user_data.keep_pixelated_resolution:
-                    # Keep output at pixelated resolution (no upscale)
-                    frame = pixelated_frame
+                # Log pixelated depth info
+                if not hasattr(user_data, '_pixelated_depth_logged'):
+                    print(f"✓ [BLEND] Pixelated depth ready: shape={pixelated_depth.shape}, range=[{pixelated_depth.min():.3f}, {pixelated_depth.max():.3f}]")
+                    print(f"   Pixelated frame shape: {pixelated_frame.shape}")
+                    mask_pixels_count = np.sum((pixelated_frame > 0).any(axis=2))
+                    print(f"   Mask pixels to blend: {mask_pixels_count}")
+                    user_data._pixelated_depth_logged = True
+                
+                # Normalize depth to 0-1 range (closer = higher value, farther = lower value)
+                if depth_max > depth_min:
+                    # Invert so closer objects have higher values (for brightness)
+                    normalized_depth = 1.0 - ((pixelated_depth - depth_min) / (depth_max - depth_min))
+                    normalized_depth = np.clip(normalized_depth, 0.0, 1.0)
                 else:
-                    # Upscale back to original size using nearest neighbor to maintain pixelated look
-                    frame = cv2.resize(pixelated_frame, (orig_w, orig_h), 
-                                      interpolation=cv2.INTER_NEAREST)
+                    normalized_depth = np.ones((OUTPUT_PIXELATED_HEIGHT, OUTPUT_PIXELATED_WIDTH), dtype=np.float32)
+                
+                # Apply depth modulation to colored masks
+                # Closer objects (high depth value) = brighter, farther (low depth value) = darker
+                # Only modulate pixels that are part of masks (non-black pixels)
+                mask_pixels = (pixelated_frame > 0).any(axis=2)  # Find non-black pixels
+                
+                # Make the depth effect more pronounced: 0.2 (minimum brightness) + 0.8 * depth
+                # This creates a stronger contrast between close and far objects
+                depth_factor = 0.2 + 0.8 * normalized_depth
+                depth_factor_3d = depth_factor[:, :, np.newaxis]
+                
+                # Log depth factor info
+                if not hasattr(user_data, '_depth_factor_logged'):
+                    if np.sum(mask_pixels) > 0:
+                        depth_factor_in_masks = depth_factor[mask_pixels]
+                        print(f"✓ [BLEND] Depth factor range in masks: [{depth_factor_in_masks.min():.3f}, {depth_factor_in_masks.max():.3f}]")
+                    user_data._depth_factor_logged = True
+                
+                # Apply depth modulation only to mask pixels
+                pixelated_frame = np.where(
+                    mask_pixels[:, :, np.newaxis],
+                    (pixelated_frame * depth_factor_3d).astype(np.uint8),
+                    pixelated_frame
+                )
+                
+                # Debug logging (first frame only)
+                if not hasattr(user_data, '_depth_blend_logged'):
+                    mask_count = np.sum(mask_pixels)
+                    depth_min_val = normalized_depth[mask_pixels].min() if mask_count > 0 else 0
+                    depth_max_val = normalized_depth[mask_pixels].max() if mask_count > 0 else 0
+                    print(f"✓ [BLEND] Depth blending applied: {mask_count} mask pixels")
+                    print(f"   Normalized depth range in masks: {depth_min_val:.3f} to {depth_max_val:.3f}")
+                    print(f"   Brightness range: {0.2 + 0.8 * depth_min_val:.3f} to {0.2 + 0.8 * depth_max_val:.3f}")
+                    user_data._depth_blend_logged = True
+            elif user_data.depth_enabled and depth_data_full is None:
+                # Debug logging (first frame only)
+                if not hasattr(user_data, '_depth_blend_logged'):
+                    print(f"⚠️  [BLEND] Depth enabled but depth_data_full is None - blending skipped")
+                    print(f"   depth_data_cache is None: {user_data.depth_data_cache is None}")
+                    user_data._depth_blend_logged = True
+            
+            # Conditionally upscale back to original size based on config
+            if user_data.keep_pixelated_resolution:
+                # Keep output at pixelated resolution (no upscale)
+                frame = pixelated_frame
+            else:
+                # Upscale back to original size using nearest neighbor to maintain pixelated look
+                frame = cv2.resize(pixelated_frame, (orig_w, orig_h), 
+                                  interpolation=cv2.INTER_NEAREST)
             
             # Update latest_frame for web streaming
             # OPTIMIZATION: Only copy if web preview is active
@@ -850,6 +1211,39 @@ if __name__ == "__main__":
         filter_pad = filter_identity.get_static_pad("src")
         filter_pad.add_probe(Gst.PadProbeType.BUFFER, filter_callback, user_data)
         print("✓ Hardware filter connected (filtering before box overlay)")
+    
+    # Connect the depth extraction probe if depth is enabled
+    # The depth wrapper's hailocropper expects detections, so it creates empty ROI when depth runs first
+    # Try to probe the depth inference element's output directly, before the wrapper's cropper
+    if user_data.depth_enabled:
+        # Try the depth inference element's output pad (before wrapper's cropper)
+        depth_inference = app.pipeline.get_by_name("depth_inference")
+        if depth_inference:
+            depth_pad = depth_inference.get_static_pad("src")
+            if depth_pad:
+                depth_pad.add_probe(Gst.PadProbeType.BUFFER, depth_extraction_callback, user_data)
+                print("✓ Depth extraction callback connected on depth_inference element output (before wrapper cropper)")
+            else:
+                print("⚠️  depth_inference found but has no src pad")
+        else:
+            # Fallback: try the identity element we added
+            depth_extractor = app.pipeline.get_by_name("depth_extractor")
+            if depth_extractor:
+                depth_pad = depth_extractor.get_static_pad("src")
+                if depth_pad:
+                    depth_pad.add_probe(Gst.PadProbeType.BUFFER, depth_extraction_callback, user_data)
+                    print("✓ Depth extraction callback connected on depth_extractor (extracting depth before segmentation)")
+                else:
+                    print("⚠️  depth_extractor found but has no src pad")
+            else:
+                # List available elements for debugging
+                print(f"⚠️  Depth enabled but depth_inference element not found")
+                try:
+                    all_elements = [e.get_name() for e in app.pipeline.iterate_elements()]
+                    depth_related = [e for e in all_elements if 'depth' in e.lower()]
+                    print(f"   Depth-related elements found: {depth_related[:10]}")
+                except:
+                    pass
     
     app.run()
 
